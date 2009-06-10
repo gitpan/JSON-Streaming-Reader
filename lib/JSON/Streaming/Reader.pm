@@ -11,8 +11,9 @@ use strict;
 use warnings;
 use Carp;
 use IO::Scalar;
+use JSON::Streaming::Reader::EventWrapper;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 use constant ROOT_STATE => {};
 
@@ -45,6 +46,16 @@ sub for_string {
     return $class->for_stream($stream);
 }
 
+sub event_based {
+    my ($class, %callbacks) = @_;
+
+    my $fake_stream = JSON::Streaming::Reader::EventWrapper->new();
+    my $self = $class->for_stream($fake_stream);
+    $self->{event_callbacks} = \%callbacks;
+
+    return $self;
+}
+
 sub process_tokens {
     my ($self, %callbacks) = @_;
 
@@ -61,7 +72,6 @@ sub get_token {
     return undef if $self->{errored};
 
     my $tok = eval {
-        my $done_comma;
         my $need_comma = $self->made_value;
         while (1) { # Until we find a character that's interesting
             $self->_eat_whitespace();
@@ -77,12 +87,12 @@ sub get_token {
             # already seen stuff then there's junk at the end of the string.
             die("Unexpected junk at the end of input\n") if $self->_state == ROOT_STATE && $self->{used};
 
-            if ($char eq ',' && ! $done_comma) {
+            if ($char eq ',' && ! $self->done_comma) {
                 if ($self->in_array || $self->in_object) {
                     if ($self->made_value) {
                         $self->_require_char(',');
 
-                        $done_comma = 1;
+                        $self->_set_done_comma();
                         next;
                     }
                 }
@@ -102,11 +112,11 @@ sub get_token {
                 # If we're in an object then we must start a property here.
                 my $name_token = $self->_get_string_token();
                 die "Expected string\n" unless $name_token->[0] eq ADD_STRING;
+                $self->_eat_whitespace();
+                $self->_require_char(":");
                 my $property_name = $name_token->[1];
                 my $state = $self->_push_state();
                 $state->{in_property} = 1;
-                $self->_eat_whitespace();
-                $self->_require_char(":");
                 return [ START_PROPERTY, $property_name ];
             }
 
@@ -118,7 +128,7 @@ sub get_token {
                 return [ START_OBJECT ];
             }
             elsif ($char eq '}') {
-                die("Expected another property\n") if $done_comma;
+                die("Expected another property\n") if $self->done_comma;
 
                 # If we're in a property then this also indicates
                 # the end of the property.
@@ -147,7 +157,7 @@ sub get_token {
             }
             elsif ($char eq ']') {
                 die("End of array without matching start\n") unless $self->in_array;
-                die("Expected another value\n") if $done_comma;
+                die("Expected another value\n") if $self->done_comma;
                 $self->_require_char(']');
                 $self->_pop_state();
                 $self->_set_made_value();
@@ -155,12 +165,12 @@ sub get_token {
             }
             elsif ($char eq '"') {
                 die("Unexpected string value\n") unless $self->can_start_value;
-                die("Expected ,\n") if $need_comma && ! $done_comma;
+                die("Expected ,\n") if $need_comma && ! $self->done_comma;
                 return $self->_get_string_token();
             }
             elsif ($char eq 't') {
                 die("Unexpected boolean value\n") unless $self->can_start_value;
-                die("Expected ,\n") if $need_comma && ! $done_comma;
+                die("Expected ,\n") if $need_comma && ! $self->done_comma;
                 foreach my $c (qw(t r u e)) {
                     $self->_require_char($c);
                 }
@@ -169,7 +179,7 @@ sub get_token {
             }
             elsif ($char eq 'f') {
                 die("Unexpected boolean value\n") unless $self->can_start_value;
-                die("Expected ,\n") if $need_comma && ! $done_comma;
+                die("Expected ,\n") if $need_comma && ! $self->done_comma;
                 foreach my $c (qw(f a l s e)) {
                     $self->_require_char($c);
                 }
@@ -178,7 +188,7 @@ sub get_token {
             }
             elsif ($char eq 'n') {
                 die("Unexpected null\n") unless $self->can_start_value;
-                die("Expected ,\n") if $need_comma && ! $done_comma;
+                die("Expected ,\n") if $need_comma && ! $self->done_comma;
                 foreach my $c (qw(n u l l)) {
                     $self->_require_char($c);
                 }
@@ -187,7 +197,7 @@ sub get_token {
             }
             elsif ($char =~ /^[\d\-]/) {
                 die("Unexpected number value\n") unless $self->can_start_value;
-                die("Expected ,\n") if $need_comma && ! $done_comma;
+                die("Expected ,\n") if $need_comma && ! $self->done_comma;
                 return $self->_get_number_token();
             }
 
@@ -196,10 +206,18 @@ sub get_token {
         }
     };
     if ($@) {
-        $self->{errored} = 1;
-        my $error = $@;
-        chomp $error;
-        return [ ERROR, $error ];
+        unless (ref($@) && $@ == JSON::Streaming::Reader::EventWrapper::UNDERRUN()) {
+            $self->{errored} = 1;
+            my $error = $@;
+            chomp $error;
+            return [ ERROR, $error ];
+        }
+        else {
+            # If it's an underrun signal from our weird event-based IO wrapper,
+            # we pass it through to the caller.
+
+            die $@;
+        }
     }
 
     return $tok;
@@ -208,6 +226,8 @@ sub get_token {
 
 sub skip {
     my ($self) = @_;
+
+    Carp::croak("Can't skip() on an event-based reader") if $self->is_event_based;
 
     my @end_chars;
 
@@ -246,6 +266,71 @@ sub skip {
         }
     }
 
+}
+
+sub signal_eof {
+    my ($self) = @_;
+
+    Carp::croak("Can't signal_eof on a non-event-based JSON reader") unless $self->is_event_based;
+
+    $self->{stream}->signal_eof();
+
+    # Now feed the buffer with nothing to get it to process
+    # whatever we have left in the buffer.
+    my $empty = '';
+    $self->feed_buffer(\$empty);
+}
+
+sub feed_buffer {
+    my ($self, $new_data) = @_;
+
+    Carp::croak("Can't feed_buffer on a non-event-based JSON reader") unless $self->is_event_based;
+
+    my $stream = $self->{stream};
+
+    $stream->feed_buffer($new_data);
+
+    # Retain the peek value so we can restore it if we roll back
+    my $old_peek = $self->{peeked};
+
+    # Start a read transaction so we can roll back if there's a buffer underrun
+    $stream->begin_reading();
+
+    my $callbacks = $self->{event_callbacks};
+
+    # Now get our normal, blocking parsing code to try to read tokens until we underrun the buffer.
+    eval {
+        while (my $token = $self->get_token()) {
+            $stream->complete_reading();
+
+            my $token_type = shift @$token;
+            my $callback = $callbacks->{$token_type} or Carp::croak("No callback provided for $token_type tokens");
+            $callback->(@$token);
+
+            # Start a new transaction at the end of the last token.
+            my $old_peek = $self->{peeked};
+            $stream->begin_reading();
+        }
+    };
+    if ($@) {
+        my $err = $@;
+        if (ref($err) && $err == JSON::Streaming::Reader::EventWrapper::UNDERRUN()) {
+            # Roll back and try again when we get more data.
+            $stream->roll_back_reading();
+            $self->{peeked} = $old_peek;
+            return;
+        }
+        else {
+            # Some other kind of error. Re-throw.
+            die $err;
+        }
+    }
+    else {
+        # We hit EOF without an underrun, so we just need to clean up now.
+        $stream->complete_reading();
+        my $callback = $callbacks->{eof} or Carp::croak("No callback provided for eof");
+        $callback->();
+    }
 }
 
 sub _get_char {
@@ -488,9 +573,18 @@ sub made_value {
     return $_[0]->_state->{made_value} ? 1 : 0;
 }
 
+sub done_comma {
+    return $_[0]->_state->{done_comma} ? 1 : 0;
+}
+
 sub _set_made_value {
     $_[0]->_state->{made_value} = 1 unless $_[0]->_state == ROOT_STATE;
+    $_[0]->_state->{done_comma} = 0 unless $_[0]->_state == ROOT_STATE;
     $_[0]->{used} = 1;
+}
+
+sub _set_done_comma {
+    $_[0]->_state->{done_comma} = 1 unless $_[0]->_state == ROOT_STATE;
 }
 
 sub can_start_value {
@@ -502,6 +596,10 @@ sub can_start_value {
 
 sub _expecting_property {
     return $_[0]->in_object ? 1 : 0;
+}
+
+sub is_event_based {
+    return defined($_[0]->{event_callbacks});
 }
 
 1;
@@ -597,6 +695,60 @@ JSON syntax error within the content that is skipped.
 Note that errors encountered during skip are actually raised via C<die> rather than
 via the return value as with C<get_token>.
 
+=head1 EVENT-BASED API
+
+This module has an experimental event-based API which can be used to
+do streaming JSON processing in event-driven applications or those
+which do non-blocking I/O.
+
+In event-based mode it is the caller's responsibility to obtain data and
+when data is available provide it to the reader for processing. When
+enough data is available to unambigously represent a complete, atomic token
+a callback function is called in a similar fashion to the callback-based API
+described above.
+
+The event-based API implementation is currently somewhat hacky and
+inefficient. Caution is advised when making use of it in production
+applications, since it is currently merely a shim over the existing
+blocking API which may introduce strange packet-boundary bugs
+and other misbehavior.
+
+=head2 JSON::Streaming::Reader->event_based(%callbacks)
+
+Creates and returns an event-based reader. Callbacks are provided in the same way
+as to the C<process_tokens> method in the callback-based API, though
+here there is an additional pseudo-token type called 'eof' which
+signals that the end of the stream has been reached.
+
+Note that at present it is not possible to use the C<skip> method
+on an event-based reader, since its implementation still expects
+to be able to block. This ought to be fixed in a future version.
+
+=head2 $jsonr->feed_buffer(\$data)
+
+The caller must call this method whenever new data becomes available
+for processing. A call to this method causes the reader to append
+the supplied data to any existing buffer and then try to consume as
+many tokens as possible from the buffer before returning. A callback
+will be run for each complete token encountered in the buffer.
+
+If the additional data does not allow a complete token to be recognised,
+the reader will retain the leftover buffer and attempt parsing again
+at the next call to C<feed_buffer>.
+
+In most cases this method will be called in response to some event,
+such as a notification that more data is available to read on a socket.
+
+=head2 $jsonr->signal_eof()
+
+The caller must call this method to signal the end of the data stream.
+This will cause the parser to process any remaining bytes in the buffer,
+possibly running token callbacks in the process, and then call the
+special eof callback.
+
+In most cases this method will be called in response to some event,
+such as a notification that a socket stream has been closed.
+
 =head1 TOKEN TYPES
 
 There are two major classes of token types. Bracketing tokens enclose other tokens
@@ -648,21 +800,15 @@ Indicates a tokenization error. A human-readable description of the error is inc
 
 =head1 STREAM BUFFERING
 
-This module doesn't do any buffering. It expects the underlying stream to
-do appropriate read buffering if necessary.
+Except in event-based mode, this module doesn't do any buffering.
+It expects the underlying stream to do appropriate read buffering
+if necessary.
 
-=head1 LIMITATIONS
-
-=head2 No Non-blocking API
-
-Currently there is no way to make this module do non-blocking reads. In future
-an event-based version of the callback-based API could be added that can be
-used in applications that must not block while the whole object is processed, such
-as those using L<POE> or L<Danga::Socket>. This would require some considerable
-refactoring, however.
-
-This module expects to be able to do blocking reads on the provided stream. It will
-not behave well if a read fails with C<EWOULDBLOCK>, so passing non-blocking
-L<IO::Socket> objects is not recommended.
+In event-based mode an internal buffer is used which retains
+bytes that are not yet enough to unambiguously represent
+a complete token so that it can retry when more data is available.
+In this situation it is up to the caller to read from its
+data source in an appropriate manner, but it is best to provide
+as much data as possible in a single data notification.
 
 
