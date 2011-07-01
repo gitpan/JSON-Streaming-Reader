@@ -13,7 +13,7 @@ use Carp;
 use IO::Scalar;
 use JSON::Streaming::Reader::EventWrapper;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use constant ROOT_STATE => {};
 
@@ -91,6 +91,12 @@ sub get_token {
                 if ($self->in_array || $self->in_object) {
                     if ($self->made_value) {
                         $self->_require_char(',');
+
+                        if($self->is_event_based) {
+                            my $stream = $self->{stream};
+                            $stream->complete_reading;
+                            $stream->begin_reading;
+                        }
 
                         $self->_set_done_comma();
                         next;
