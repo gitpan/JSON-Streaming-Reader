@@ -13,7 +13,7 @@ use Carp;
 use IO::Scalar;
 use JSON::Streaming::Reader::EventWrapper;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 use constant ROOT_STATE => {};
 
@@ -973,4 +973,9 @@ In this situation it is up to the caller to read from its
 data source in an appropriate manner, but it is best to provide
 as much data as possible in a single data notification.
 
+=head1 LICENSE
 
+Copyright 2009 Martin Atkins <mart@degeneration.co.uk>.
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself.
